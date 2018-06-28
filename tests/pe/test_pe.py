@@ -91,6 +91,25 @@ class TestPe(TestCase):
             self.logger.debug(stdout)
             self.assertIn("Hello World", stdout)
 
+    def test_unwind(self):
+
+        path = get_sample("PE/PE64_x86-64_binary_cmd.exe")
+        sample = lief.parse(path)
+
+        functions = sorted(sample.functions, key=lambda f: f.address)
+
+        self.assertEqual(len(functions), 1058)
+
+        self.assertEqual(functions[0].address, 4160)
+        self.assertEqual(functions[0].size,    107)
+        self.assertEqual(functions[0].name,    "")
+
+        self.assertEqual(functions[-1].address, 169784)
+        self.assertEqual(functions[-1].size,    0)
+        self.assertEqual(functions[-1].name,    "BrandingFormatString")
+
+
+
 
     def tearDown(self):
         # Delete it
