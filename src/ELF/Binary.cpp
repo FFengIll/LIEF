@@ -2563,6 +2563,8 @@ LIEF::Binary::functions_t Binary::functions(void) const {
 
 
 
+
+
   return {std::begin(functions_set), std::end(functions_set)};
 }
 

@@ -1559,8 +1559,8 @@ LIEF::Binary::functions_t Binary::unwind_functions(void) const {
   }
 
   return {
-    std::make_move_iterator(std::begin(functions)),
-    std::make_move_iterator(std::end(functions))
+    std::begin(functions),
+    std::end(functions)
   };
 }
 
