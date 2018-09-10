@@ -2306,211 +2306,217 @@ LIEF::Binary::functions_t Binary::armexid_functions(void) const {
 LIEF::Binary::functions_t Binary::eh_frame_functions(void) const {
   LIEF::Binary::functions_t functions;
 
-  if (this->has(SEGMENT_TYPES::PT_GNU_EH_FRAME)) {
-
-    if (not (this->has_section(".eh_frame_hdr") and this->has_section(".eh_frame"))) {
-      LOG(WARNING) << "'.eh_frame_hdr' and / or '.eh_frame' sections not found";
-
-    }
-    std::vector<uint8_t> content;
-    const Section& eh_frame_hdr = this->get_section(".eh_frame_hdr");
-    const Section& eh_frame     = this->get_section(".eh_frame");
-    const size_t gap = eh_frame.virtual_address() - (eh_frame_hdr.virtual_address() + eh_frame_hdr.size());
-
-
-    const std::vector<uint8_t>& eh_frame_hdr_data = eh_frame_hdr.content();
-    const std::vector<uint8_t>& eh_frame_data     = eh_frame.content();
-
-    std::copy(std::begin(eh_frame_hdr_data), std::end(eh_frame_hdr_data), std::back_inserter(content));
-    content.insert(std::end(content), gap, 0);
-    std::copy(std::begin(eh_frame_data), std::end(eh_frame_data), std::back_inserter(content));
-
-
-    const bool is64 = (this->type() == ELF_CLASS::ELFCLASS64);
-
-    VectorStream vs{std::move(content)};
-
-    // Read Eh Frame header
-    uint8_t version          = vs.read<uint8_t>();
-    uint8_t eh_frame_ptr_enc = vs.read<uint8_t>(); // How pointers are encoded
-    uint8_t fde_count_enc    = vs.read<uint8_t>();
-    uint8_t table_enc        = vs.read<uint8_t>();
-
-    int64_t eh_frame_ptr = vs.read_dwarf_encoded(eh_frame_ptr_enc);
-    int64_t fde_count    = 0;
-
-    if (static_cast<DWARF::EH_ENCODING>(fde_count_enc) != DWARF::EH_ENCODING::OMIT) {
-      fde_count = vs.read_dwarf_encoded(fde_count_enc);
-    }
-
-    if (version != 1) {
-      LOG(WARNING) << "EH Frame header version is not 1 " << std::dec
-                   << "(" << version << ") structure may have been corrupted!";
-    }
-
-    if (fde_count < 0) {
-      LOG(WARNING) << "fde_count is corrupted (negative value)";
-      fde_count = 0;
-    }
-
-
-
-    VLOG(VDEBUG) << std::showbase << std::left
-               << std::setw(20) << std::setfill(' ') << "eh_frame_ptr_enc: " << std::hex << static_cast<uint32_t>(eh_frame_ptr_enc) << std::endl
-               << std::setw(20) << std::setfill(' ') << "fde_count_enc: "    << std::hex << static_cast<uint32_t>(fde_count_enc) << std::endl
-               << std::setw(20) << std::setfill(' ') << "table_enc: "        << std::hex << static_cast<uint32_t>(table_enc) << std::endl;
-
-    VLOG(VDEBUG) << std::setw(20) << std::setfill(' ') << "eh_frame_ptr: " << std::hex << eh_frame_ptr << std::endl;
-    VLOG(VDEBUG) << std::setw(20) << std::setfill(' ') << "fde_count: " << fde_count << std::endl;
-
-    DWARF::EH_ENCODING table_bias = static_cast<DWARF::EH_ENCODING>(table_enc & 0xF0);
-
-    for (size_t i = 0; i < static_cast<size_t>(fde_count); ++i) {
-
-      // Read Function address / FDE address within the
-      // Binary search table
-      uint32_t initial_location = vs.read_dwarf_encoded(table_enc);
-      uint32_t address          = vs.read_dwarf_encoded(table_enc);
-      uint64_t bias             = 0;
-
-      switch (table_bias) {
-        case DWARF::EH_ENCODING::PCREL:
-          {
-            bias = (eh_frame_hdr.virtual_address() + vs.pos());
-            break;
-          }
-
-        case DWARF::EH_ENCODING::TEXTREL:
-          {
-            LOG(WARNING) << "EH_ENCODING::TEXTREL is not supported";
-            break;
-          }
-
-        case DWARF::EH_ENCODING::DATAREL:
-          {
-            bias = eh_frame_hdr.virtual_address();
-            break;
-          }
-
-        case DWARF::EH_ENCODING::FUNCREL:
-          {
-            LOG(WARNING) << "EH_ENCODING::FUNCREL is not supported";
-            break;
-          }
-
-        case DWARF::EH_ENCODING::ALIGNED:
-          {
-            LOG(WARNING) << "EH_ENCODING::ALIGNED is not supported";
-            break;
-          }
-
-        default:
-          {
-            LOG(WARNING) << "Encoding not supported!";
-            break;
-          }
-      }
-      initial_location += bias;
-      address          += bias;
-
-      VLOG(VDEBUG) << "Initial location: " << initial_location;
-      VLOG(VDEBUG) << "Address: "          << address;
-      VLOG(VDEBUG) << "Bias: "             << std::hex << bias;
-      const size_t saved_pos = vs.pos();
-
-      // Go to the FDE structure
-      vs.setpos(address - bias);
-      {
-
-        // Beginning of the FDE structure (to continue)
-        uint64_t fde_length  = vs.read<uint32_t>();
-        fde_length = fde_length == static_cast<uint32_t>(-1) ? vs.read<uint64_t>() : fde_length;
-
-        uint32_t cie_pointer = vs.read<uint32_t>();
-
-        if (cie_pointer == 0) {
-          LOG(WARNING) << "cie_pointer is null!";
-          vs.setpos(saved_pos);
-          continue;
-        }
-
-        uint32_t cie_offset  = vs.pos() - cie_pointer - sizeof(uint32_t);
-
-
-        VLOG(VDEBUG) << "fde_length@"  << std::hex << address - bias << ": " << fde_length;
-        VLOG(VDEBUG) << "cie_pointer " << std::hex << cie_pointer;
-        VLOG(VDEBUG) << "cie_offset "  << cie_offset;
-
-
-        // Go to CIE structure
-        //uint8_t augmentation_data = static_cast<uint8_t>(DWARF::EH_ENCODING::OMIT);
-
-        const size_t saved_pos = vs.pos();
-        uint8_t augmentation_data = 0;
-        vs.setpos(cie_offset);
-        {
-          uint64_t cie_length = vs.read<uint32_t>();
-          cie_length = cie_length == static_cast<uint32_t>(-1) ? vs.read<uint64_t>() : cie_length;
-
-          uint32_t cie_id     = vs.read<uint32_t>();
-          uint32_t version    = vs.read<uint8_t>();
-
-          if (cie_id != 0) {
-            LOG(WARNING) << "CIE ID is not 0 "
-                         << std::dec << "(" << cie_id << ")";
-          }
-
-          if (version != 1) {
-            LOG(WARNING) << "CIE Version is not 1 "
-                         << std::dec << "(" << version << ")";
-          }
-
-          VLOG(VDEBUG) << "cie_length:" << cie_length;
-          VLOG(VDEBUG) << "ID: "      << cie_id;
-          VLOG(VDEBUG) << "Version: " << version;
-
-          std::string cie_augmentation_string = vs.read_string();
-          if (cie_augmentation_string.find("eh") != std::string::npos) {
-            if (is64) {
-              /* uint64_t eh_data = */ vs.read<uint64_t>();
-            } else {
-              /* uint32_t eh_data = */ vs.read<uint32_t>();
-            }
-          }
-
-          /* uint64_t code_alignment         = */ vs.read_uleb128();
-          /* int64_t  data_alignment         = */ vs.read_sleb128();
-          /* uint64_t return_addres_register = */ vs.read_uleb128();
-          if (cie_augmentation_string.find('z') != std::string::npos) {
-            /* int64_t  augmentation_length    = */ vs.read_uleb128();
-          }
-          VLOG(VDEBUG) << cie_augmentation_string;
-
-
-          if (cie_augmentation_string.size() > 0 and cie_augmentation_string[0] == 'z') {
-            if (cie_augmentation_string.find('R') != std::string::npos) {
-              augmentation_data = vs.read<uint8_t>();
-            } else {
-              LOG(WARNING) << "Augmentation string '" << cie_augmentation_string << "' is not supported";
-            }
-          }
-        }
-        VLOG(VDEBUG) << "Augmentation data "  << std::hex << static_cast<uint32_t>(augmentation_data) << std::endl;
-
-        // Go back to FDE Structure
-        vs.setpos(saved_pos);
-        int32_t function_begin = eh_frame.virtual_address() + vs.pos() + vs.read_dwarf_encoded(augmentation_data);
-        int32_t size           = vs.read_dwarf_encoded(augmentation_data);
-
-        // Create the function
-        Function f{static_cast<uint64_t>(initial_location)};
-        f.size(size);
-        functions.push_back(std::move(f));
-        VLOG(VDEBUG) << "PC BEGIN/SIZE: " << std::hex << function_begin << " : " << size  << std::endl;
-      }
-      vs.setpos(saved_pos);
-    }
+  if (not this->has(SEGMENT_TYPES::PT_GNU_EH_FRAME)) {
+    return functions;
   }
+
+  uint64_t eh_frame_addr = this->get(SEGMENT_TYPES::PT_GNU_EH_FRAME).virtual_address();
+  uint64_t eh_frame_off  = this->virtual_address_to_offset(eh_frame_addr);
+  auto&& it_load_segment = std::find_if(
+      std::begin(this->segments_),
+      std::end(this->segments_),
+      [eh_frame_addr] (const Segment* s) {
+        return s->type() == SEGMENT_TYPES::PT_LOAD and
+          s->virtual_address() <= eh_frame_addr and eh_frame_addr < (s->virtual_address() + s->virtual_size());
+      });
+
+  if (it_load_segment == std::end(this->segments_)) {
+    LOG(ERROR) << "Unable to find the LOAD segment associated with PT_GNU_EH_FRAME";
+    return functions;
+  }
+  const Segment* load_segment = *it_load_segment;
+
+  const bool is64 = (this->type() == ELF_CLASS::ELFCLASS64);
+
+  VectorStream vs{std::move(load_segment->content())};
+  vs.setpos(eh_frame_off);
+
+  if (vs.size() < 4 * sizeof(uint8_t)) {
+    LOG(WARNING) << "Unable to read EH frame header";
+    return functions;
+  }
+
+  // Read Eh Frame header
+  uint8_t version          = vs.read<uint8_t>();
+  uint8_t eh_frame_ptr_enc = vs.read<uint8_t>(); // How pointers are encoded
+  uint8_t fde_count_enc    = vs.read<uint8_t>();
+  uint8_t table_enc        = vs.read<uint8_t>();
+
+  int64_t eh_frame_ptr = vs.read_dwarf_encoded(eh_frame_ptr_enc);
+  int64_t fde_count    = -1;
+
+  if (static_cast<DWARF::EH_ENCODING>(fde_count_enc) != DWARF::EH_ENCODING::OMIT) {
+    fde_count = vs.read_dwarf_encoded(fde_count_enc);
+  }
+
+  if (version != 1) {
+    LOG(WARNING) << "EH Frame header version is not 1 " << std::dec
+                 << "(" << version << ") structure may have been corrupted!";
+  }
+
+  if (fde_count < 0) {
+    LOG(WARNING) << "fde_count is corrupted (negative value)";
+    fde_count = 0;
+  }
+
+
+
+  VLOG(VDEBUG) << std::showbase << std::left
+             << std::setw(20) << std::setfill(' ') << "eh_frame_ptr_enc: " << std::hex << static_cast<uint32_t>(eh_frame_ptr_enc) << std::endl
+             << std::setw(20) << std::setfill(' ') << "fde_count_enc: "    << std::hex << static_cast<uint32_t>(fde_count_enc) << std::endl
+             << std::setw(20) << std::setfill(' ') << "table_enc: "        << std::hex << static_cast<uint32_t>(table_enc) << std::endl;
+
+  VLOG(VDEBUG) << std::setw(20) << std::setfill(' ') << "eh_frame_ptr: " << std::hex << eh_frame_ptr << std::endl;
+  VLOG(VDEBUG) << std::setw(20) << std::setfill(' ') << "fde_count: " << fde_count << std::endl;
+
+  DWARF::EH_ENCODING table_bias = static_cast<DWARF::EH_ENCODING>(table_enc & 0xF0);
+
+  for (size_t i = 0; i < static_cast<size_t>(fde_count); ++i) {
+
+    // Read Function address / FDE address within the
+    // Binary search table
+    uint32_t initial_location = vs.read_dwarf_encoded(table_enc);
+    uint32_t address          = vs.read_dwarf_encoded(table_enc);
+    uint64_t bias             = 0;
+
+    switch (table_bias) {
+      case DWARF::EH_ENCODING::PCREL:
+        {
+          bias = (eh_frame_addr + vs.pos());
+          break;
+        }
+
+      case DWARF::EH_ENCODING::TEXTREL:
+        {
+          LOG(WARNING) << "EH_ENCODING::TEXTREL is not supported";
+          break;
+        }
+
+      case DWARF::EH_ENCODING::DATAREL:
+        {
+          bias = eh_frame_addr;
+          break;
+        }
+
+      case DWARF::EH_ENCODING::FUNCREL:
+        {
+          LOG(WARNING) << "EH_ENCODING::FUNCREL is not supported";
+          break;
+        }
+
+      case DWARF::EH_ENCODING::ALIGNED:
+        {
+          LOG(WARNING) << "EH_ENCODING::ALIGNED is not supported";
+          break;
+        }
+
+      default:
+        {
+          LOG(WARNING) << "Encoding not supported!";
+          break;
+        }
+    }
+    initial_location += bias;
+    address          += bias;
+
+    VLOG(VDEBUG) << "Initial location: " << initial_location;
+    VLOG(VDEBUG) << "Address: "          << address;
+    VLOG(VDEBUG) << "Bias: "             << std::hex << bias;
+    const size_t saved_pos = vs.pos();
+
+    // Go to the FDE structure
+    vs.setpos(eh_frame_off + address - bias);
+    {
+
+      // Beginning of the FDE structure (to continue)
+      uint64_t fde_length  = vs.read<uint32_t>();
+      fde_length = fde_length == static_cast<uint32_t>(-1) ? vs.read<uint64_t>() : fde_length;
+
+      uint32_t cie_pointer = vs.read<uint32_t>();
+
+      if (cie_pointer == 0) {
+        LOG(WARNING) << "cie_pointer is null!";
+        vs.setpos(saved_pos);
+        continue;
+      }
+
+      uint32_t cie_offset  = vs.pos() - cie_pointer - sizeof(uint32_t);
+
+
+      VLOG(VDEBUG) << "fde_length@"  << std::hex << address - bias << ": " << fde_length;
+      VLOG(VDEBUG) << "cie_pointer " << std::hex << cie_pointer;
+      VLOG(VDEBUG) << "cie_offset "  << cie_offset;
+
+
+      // Go to CIE structure
+      //uint8_t augmentation_data = static_cast<uint8_t>(DWARF::EH_ENCODING::OMIT);
+
+      const size_t saved_pos = vs.pos();
+      uint8_t augmentation_data = 0;
+      vs.setpos(cie_offset);
+      {
+        uint64_t cie_length = vs.read<uint32_t>();
+        cie_length = cie_length == static_cast<uint32_t>(-1) ? vs.read<uint64_t>() : cie_length;
+
+        uint32_t cie_id     = vs.read<uint32_t>();
+        uint32_t version    = vs.read<uint8_t>();
+
+        if (cie_id != 0) {
+          LOG(WARNING) << "CIE ID is not 0 "
+                       << std::dec << "(" << cie_id << ")";
+        }
+
+        if (version != 1) {
+          LOG(WARNING) << "CIE Version is not 1 "
+                       << std::dec << "(" << version << ")";
+        }
+
+        VLOG(VDEBUG) << "cie_length:" << cie_length;
+        VLOG(VDEBUG) << "ID: "      << cie_id;
+        VLOG(VDEBUG) << "Version: " << version;
+
+        std::string cie_augmentation_string = vs.read_string();
+        if (cie_augmentation_string.find("eh") != std::string::npos) {
+          if (is64) {
+            /* uint64_t eh_data = */ vs.read<uint64_t>();
+          } else {
+            /* uint32_t eh_data = */ vs.read<uint32_t>();
+          }
+        }
+
+        /* uint64_t code_alignment         = */ vs.read_uleb128();
+        /* int64_t  data_alignment         = */ vs.read_sleb128();
+        /* uint64_t return_addres_register = */ vs.read_uleb128();
+        if (cie_augmentation_string.find('z') != std::string::npos) {
+          /* int64_t  augmentation_length    = */ vs.read_uleb128();
+        }
+        VLOG(VDEBUG) << cie_augmentation_string;
+
+
+        if (cie_augmentation_string.size() > 0 and cie_augmentation_string[0] == 'z') {
+          if (cie_augmentation_string.find('R') != std::string::npos) {
+            augmentation_data = vs.read<uint8_t>();
+          } else {
+            LOG(WARNING) << "Augmentation string '" << cie_augmentation_string << "' is not supported";
+          }
+        }
+      }
+      VLOG(VDEBUG) << "Augmentation data "  << std::hex << static_cast<uint32_t>(augmentation_data) << std::endl;
+
+      // Go back to FDE Structure
+      vs.setpos(saved_pos);
+      int32_t function_begin = eh_frame_addr + vs.pos() + vs.read_dwarf_encoded(augmentation_data);
+      int32_t size           = vs.read_dwarf_encoded(augmentation_data);
+
+      // Create the function
+      Function f{static_cast<uint64_t>(initial_location)};
+      f.size(size);
+      functions.push_back(std::move(f));
+      VLOG(VDEBUG) << "PC BEGIN/SIZE: " << std::hex << function_begin << " : " << size  << std::endl;
+    }
+    vs.setpos(saved_pos);
+  }
+
   return functions;
 }
 
